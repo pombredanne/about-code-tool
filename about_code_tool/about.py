@@ -17,7 +17,7 @@
 """
 This is a tool to process ABOUT files as specified at http://dejacode.org
 ABOUT files are small text files to document the origin and license of software
-components. This tool read and validates ABOUT files to collect your software 
+components. This tool read and validates ABOUT files to collect your software
 components inventory
 """
 
@@ -37,13 +37,13 @@ import sys
 import urlparse
 from collections import namedtuple
 from datetime import datetime
-from email.Parser import HeaderParser
+from email.parser import HeaderParser
 from os import listdir, walk
-from os.path import exists, dirname, join, abspath, isdir, basename
+from os.path import exists, dirname, join, abspath, isdir, basename, normpath, relpath
 from StringIO import StringIO
 
 
-__version__ = '0.8.1'
+__version__ = '0.9.0'
 
 # see http://dejacode.org
 __about_spec_version__ = '0.8.0'
@@ -104,15 +104,15 @@ class AboutFile(object):
         try:
             with open(self.location, "rU") as file_in:
                 #FIXME: we should open the file only once, it is always small enough to be kept in memory
-                no_blank_lines, pre_proc_warnings = self.pre_process(self, file_in)
+                no_blank_lines, pre_proc_warnings = self.pre_process(file_in)
                 self.warnings.extend(pre_proc_warnings)
                 # HeaderParser.parse returns the parsed file as keys and
                 # values (allows for multiple keys, and it doesn't validate)
                 self.parsed = HeaderParser().parse(no_blank_lines)
-        except IOError, e:
+        except IOError as e:
             err_msg = 'Cannot read ABOUT file:' + repr(e)
             self.errors.append(Error(FILE, None, self.location, err_msg))
-        except Exception, e:
+        except Exception as e:
             err_msg = 'Unknown ABOUT processing error:' + repr(e)
             self.errors.append(Error(UNKNOWN, None, self.location, err_msg))
 
@@ -120,7 +120,6 @@ class AboutFile(object):
             self.warnings.extend(self.normalize())
             self.validate()
 
-    @staticmethod
     def pre_process(self, file_in):
         """
         Pre-process an ABOUT file before using the email header parser.
@@ -128,6 +127,7 @@ class AboutFile(object):
         In the file-like object we remove:
          - blank/empty lines
          - invalid lines that cannot be parsed
+         - spaces around the colon separator
         This also checks for field names with incorrect characters that could
         not be otherwise parsed.
         """
@@ -139,13 +139,11 @@ class AboutFile(object):
         for line in file_in.readlines():
             # continuation line
             if line.startswith(' '):
-                if not last_line_is_field_or_continuation:
-                    msg = 'Line does not contain a field or continuation: ignored.'
-                    warnings.append(Warn(IGNORED, None, line, msg))
-                    last_line_is_field_or_continuation = False
-                else:
+                warn = self.check_line_continuation(line, last_line_is_field_or_continuation)
+                if last_line_is_field_or_continuation:
                     about_string += line
-                    last_line_is_field_or_continuation = True
+                if warn:
+                    warnings.append(warn)
                 continue
 
             # empty or blank line
@@ -153,28 +151,29 @@ class AboutFile(object):
                 last_line_is_field_or_continuation = False
                 continue
 
-            # From here, we should have a field line not a field line if there
-            # is no colon
-            if ':' not in line:
-                msg = 'Line does not contain a field: ignored.'
-                warnings.append(Warn(IGNORED, None, line, msg))
+            # From here, we should have a field line and consider not a field
+            # line if there is no colon
+            warn, has_colon = self.check_line_has_colon(line)
+            if not has_colon:
                 last_line_is_field_or_continuation = False
+                warnings.append(warn)
                 continue
 
             # invalid space characters
             splitted = line.split(':', 1)
             field_name = splitted[0].rstrip()
-            if ' ' in field_name:
-                msg = 'Field name contains spaces: line ignored.'
-                warnings.append(Warn(IGNORED, field_name, line, msg))
+            warn = self.check_invalid_space_characters(field_name, line)
+            if warn:
                 last_line_is_field_or_continuation = False
+                warnings.append(warn)
                 continue
+            else:
+                line = field_name + ":" + splitted[1]
 
             # invalid field characters
-            invalid_chars = self.invalid_chars_in_field_name(field_name)
-            if invalid_chars:
-                msg = "Field name contains invalid characters: '%s': line ignored." % ''.join(invalid_chars)
-                warnings.append(Warn(IGNORED, field_name, line, msg))
+            invalid_chars, warn = self.check_invalid_chars_in_field_name(field_name, line)
+            if warn:
+                warnings.append(warn)
                 last_line_is_field_or_continuation = False
                 continue
 
@@ -184,6 +183,50 @@ class AboutFile(object):
 
         # TODO: we should either yield and not return a stringIO or return a string
         return StringIO(about_string), warnings
+
+    @staticmethod
+    def check_line_continuation(line, continuation):
+        warnings = ""
+        if not continuation:
+            msg = 'Line does not contain a field or continuation: ignored.'
+            warnings = Warn(IGNORED, None, line, msg)
+        return warnings
+
+    @staticmethod
+    def check_line_has_colon(line):
+        warnings = ""
+        has_colon = True
+        if ':' not in line:
+            msg = 'Line does not contain a field: ignored.'
+            warnings = Warn(IGNORED, None, line, msg)
+            has_colon = False
+        return warnings, has_colon
+
+    @staticmethod
+    def check_invalid_space_characters(field_name, line):
+        warnings = ""
+        if ' ' in field_name:
+            msg = 'Field name contains spaces: line ignored.'
+            warnings = Warn(IGNORED, field_name, line, msg)
+        return warnings
+
+    @staticmethod
+    def check_invalid_chars_in_field_name(field_name, line):
+        """
+        Return a sequence of invalid characters in a field name.
+        From spec 0.8.0:
+            A field name can contain only these US-ASCII characters:
+            <li> digits from 0 to 9 </li>
+            <li> uppercase and lowercase letters from A to Z</li>
+            <li> the _ underscore sign. </li>
+        """
+        supported = string.digits + string.ascii_letters + '_'
+        warnings = ""
+        invalid_chars = [char for char in field_name if char not in supported]
+        if invalid_chars:
+            msg = "Field name contains invalid characters: '%s': line ignored." % ''.join(invalid_chars)
+            warnings = Warn(IGNORED, field_name, line, msg)
+        return invalid_chars, warnings
 
     def normalize(self):
         """
@@ -221,7 +264,7 @@ class AboutFile(object):
         self.validate_mandatory_fields_are_present()
 
         for field_name, value in self.validated_fields.items():
-            self.check_is_ascii(field_name)
+            self.check_is_ascii(self.validated_fields.get(field_name))
             self.validate_known_optional_fields(field_name)
             self.validate_file_field_exists(field_name, value)
             self.validate_url_field(field_name, network_check=False)
@@ -305,7 +348,7 @@ class AboutFile(object):
             with codecs.open(self._location(file_path), 'r', 'utf8', errors='replace') as f:
                 # attempt to read the file to catch codec errors
                 f.readlines()
-        except Exception, e:
+        except Exception as e:
             self.errors.append(Error(FILE, field_name, file_path,
                                      'Cannot read file: %s' % repr(e)))
             return
@@ -376,15 +419,15 @@ class AboutFile(object):
         except KeyError:
             return
 
-    def check_is_ascii(self, field_name):
+    def check_is_ascii(self, str):
         """
         Return True if string is composed only of US-ASCII characters.
         """
         try:
-            field_name.decode('ascii')
+            str.decode('ascii')
         except (UnicodeEncodeError, UnicodeDecodeError):
-            msg = 'Field name: %s is not valid US-ASCII.' % field_name
-            self.errors.append(Error(ASCII, field_name, None, msg))
+            msg = '%s is not valid US-ASCII.' % str
+            self.errors.append(Error(ASCII, str, None, msg))
             return False
         return True
 
@@ -402,7 +445,7 @@ class AboutFile(object):
         supported_dateformat = '%Y-%m-%d'
         try:
             return bool(datetime.strptime(date_strings, supported_dateformat))
-        except ValueError, e:
+        except ValueError:
             msg = 'Unsupported date format, use YYYY-MM-DD.'
             self.warnings.append(Warn(DATE, field_name, date_strings, msg))
         return False
@@ -436,7 +479,7 @@ class AboutFile(object):
             http_connection = httplib.HTTPConnection('dejacode.org')
             http_connection.connect()
             return True
-        except socket.error as e:
+        except socket.error:
             return False
 
     def check_url_reachable(self, host, path):
@@ -449,7 +492,7 @@ class AboutFile(object):
             # This is the list of all the HTTP status code
             # http://en.wikipedia.org/wiki/List_of_HTTP_status_codes
             return conn.getresponse().status
-        except (httplib.HTTPException, socket.error) as e:
+        except (httplib.HTTPException, socket.error):
             return False
 
     def get_about_info(self, update_path, about_object):
@@ -462,7 +505,7 @@ class AboutFile(object):
                 row += [about_object.validated_fields[field]]
             else:
                 row += ['']
-    
+
         warnings = [repr(w) for w in about_object.warnings]
         errors = [repr(e) for e in about_object.errors]
         row += ['\n'.join(warnings), '\n'.join(errors)]
@@ -501,17 +544,33 @@ class AboutFile(object):
                 names.append(name)
         return names
 
-    def invalid_chars_in_field_name(self, field_name):
-        """
-        Return a sequence of invalid characters in a field name.
-        From spec 0.8.0:
-            A field name can contain only these US-ASCII characters:
-            <li> digits from 0 to 9 </li>
-            <li> uppercase and lowercase letters from A to Z</li>
-            <li> the _ underscore sign. </li>
-        """
-        supported = string.digits + string.ascii_letters + '_'
-        return [char for char in field_name if char not in supported]
+    def license_text(self):
+        '''
+        Returns the license text if the license_text_file field exists and the
+        field value (file) exists
+        '''
+        try:
+            license_text_path = self.file_fields_locations["license_text_file"]
+            with open(license_text_path, 'rU') as f:
+                return f.read()
+        except Exception as e:
+            pass
+        #return empty string if the license file does not exist
+        return ""
+
+    def notice_text(self):
+        '''
+        Returns the text in a notice file if the notice_file field exists in a
+        .ABOUT file and the file that is in the notice_file: field exists
+        '''
+        try:
+            notice_text_path = self.file_fields_locations["notice_file"]
+            with open(notice_text_path, 'rU') as f:
+                return f.read()
+        except Exception as e:
+            pass
+        #return empty string if the notice file does not exist
+        return ""
 
 def resource_name(resource_path):
     """
@@ -821,70 +880,158 @@ SPDX_LICENSE_IDS = dict((i.lower(), i) for i in SPDX_LICENSES)
 #=============================================================================
 
 
-def extract_about_info(input_path, output_path, opt_arg_num):
-    """
-    Collects recursively all .ABOUT files in in_path and builds rows for each.
-    Write results in CSV file at output_path
-    """
-    in_path = abspath(input_path)
-    assert exists(in_path)
-    is_dir = False
+class AboutCollector(object):
+    def __init__(self, input_path, output_path, opt_arg_num):
+        # Setup the input and output paths
+        self.original_input_path = input_path
+        self.input_path = abspath(input_path)
+        assert exists(self.input_path)
+        self.input_path_is_dir = isdir(self.input_path)
+        self.output_path = output_path
 
-    files = []
-    if isdir(in_path):
-        is_dir = True
-        for root, _, filenames in walk(in_path):
-            for filename in filenames:
-                files += [join(root, filename)]
-    else:
-        files += [in_path]
+        # Setup the verbosity
+        self.display_error = self.display_error_and_warning = False
+        if opt_arg_num == '1':
+            self.display_error = True
+        elif opt_arg_num == '2':
+            self.display_error_and_warning = True
 
-    about_data_list = []
-    warnings = errors = 0
+        self.about_files = []
+        self.about_objects = []
 
-    display_error = display_error_and_warning = False
-    if opt_arg_num == '1':
-        display_error = True
+        # Running the files collection and objects creation on instantiation
+        self.collect_about_files()
+        self.create_about_objects_from_files()
 
-    if opt_arg_num == '2':
-        display_error_and_warning = True
-
-    for about_file in filter(isvalid_about_file, files):
-        about_object = AboutFile(about_file)
-        warnings += len(about_object.warnings)
-        errors += len(about_object.errors)
-        #FIXME: why are we doing path sep conversion here?
-        if is_dir:
-            update_path = join(input_path, basename(about_file)).replace("\\", "/")
+    def collect_about_files(self):
+        """
+        Collects all .ABOUT files path given an input_path and stores the
+        results in a about_files list on the collector instance.
+        """
+        files = []
+        if self.input_path_is_dir:
+            for root, _, filenames in walk(self.input_path):
+                for filename in filenames:
+                    files += [join(root, filename)]
         else:
-            update_path = input_path.replace("\\", "/")
+            files = [self.input_path]
 
-        about_data_list.append(about_object.get_about_info(update_path, about_object))
+        self.about_files = files
 
-        if display_error:
-            if about_object.errors:
-                print("ABOUT File: %s" % update_path)
-                print("ERROR: %s\n" % about_object.errors)
-        if display_error_and_warning:
-            if about_object.errors or about_object.warnings:
-                print("ABOUT File: %s" % update_path)
+    def create_about_objects_from_files(self):
+        """
+        Parses each collected files a creates a list of AboutFile objects.
+        """
+        about_objects = []
+        identifier = 0
+        for about_file in filter(isvalid_about_file, self.about_files):
+            about_object = AboutFile(about_file)
+            about_object.unique_identifier = identifier
+            about_objects.append(about_object)
+            identifier += 1
+
+        self.about_objects = about_objects
+
+    def extract_about_info(self):
+        """
+        Builds rows for each stored about objects.
+        """
+        about_data_list = []
+        warnings_count = errors_count = 0
+
+        for about_object in self.about_objects:
+            warnings_count += len(about_object.warnings)
+            errors_count += len(about_object.errors)
+
+            #FIXME: why are we doing path sep conversion here?
+            #TODO: THis should be refactored in a separate methods.
+            #TODO: For some reasons, the join(input_path, subpath_ doesn't work
+            # if the input_path startswith "../". Therefore, using the
+            # "hardcode" to add/append the path. Need to update the code later.
+            input_path = self.original_input_path
+            if self.input_path_is_dir:
+                subpath = about_object.location.partition(basename(
+                    normpath(input_path)))[2]
+                if input_path[-1] == "/":
+                    input_path = input_path.rpartition("/")[0]
+                if input_path[-1] == "\\":
+                    input_path = input_path.rpartition("\\")[0]
+                update_path = (input_path + subpath).replace("\\", "/")
+            else:
+                update_path = input_path.replace("\\", "/")
+
+            about_data_list.append(about_object.get_about_info(update_path,
+                                                               about_object))
+
+            if self.display_error:
                 if about_object.errors:
-                    print("ERROR: %s" % about_object.errors)
-                if about_object.warnings:
-                    print("WARNING: %s\n" % about_object.warnings)
+                    print("ABOUT File: %s" % update_path)
+                    print("ERROR: %s\n" % about_object.errors)
+            if self.display_error_and_warning:
+                if about_object.errors or about_object.warnings:
+                    print("ABOUT File: %s" % update_path)
+                    if about_object.errors:
+                        print("ERROR: %s" % about_object.errors)
+                    if about_object.warnings:
+                        print("WARNING: %s\n" % about_object.warnings)
 
-    write_to_csv(output_path, about_data_list)
-    print("%d errors detected." % errors)
-    print("%d warnings detected.\n" % warnings)
+        self.write_to_csv(about_data_list)
+        if errors_count:
+            print("%d errors detected." % errors_count)
+        if warnings_count:
+            print("%d warnings detected.\n" % warnings_count)
 
-def write_to_csv(output_path, about_data_list):
-    with open(output_path, 'wb') as output_file:
-        about_spec_writer = csv.writer(output_file)
-        about_spec_writer.writerow(['about_file'] + MANDATORY_FIELDS +
-                                   OPTIONAL_FIELDS + ['warnings', 'errors'])
-        for row in about_data_list:
-            about_spec_writer.writerow(row)
+    def write_to_csv(self, about_data_list):
+        """
+        Write results in CSV file at output_path.
+        """
+        with open(self.output_path, 'wb') as output_file:
+            about_spec_writer = csv.writer(output_file)
+            about_spec_writer.writerow(['about_file'] + MANDATORY_FIELDS +
+                                       OPTIONAL_FIELDS + ['warnings', 'errors'])
+            for row in about_data_list:
+                about_spec_writer.writerow(row)
 
+    def generate_attribution(self, template_path='templates/default.html',
+                             sublist = []):
+        """
+        Generates an attribution file from a list of ABOUT files
+        """
+        try:
+            from jinja2 import Environment, FileSystemLoader, TemplateNotFound
+        except ImportError:
+            print("""The Jinja2 library is required to generate the attribution.
+            You can install the dependencies using:
+            pip install -r requirements.txt""")
+            return
+
+        template_dir = dirname(template_path)
+        template_name = basename(template_path)
+        env = Environment(loader=FileSystemLoader(template_dir))
+        try:
+            template = env.get_template(template_name)
+        except TemplateNotFound as e:
+            print (e.message)  # TODO: needs to return an error
+            return
+
+        # We only need the fields names and values to render the template
+        about_validated_fields = [about_object.validated_fields
+                                  for about_object in self.about_objects
+                                  if not sublist
+                                  or about_object.about_resource_path in sublist]
+
+        about_license_text = [about_object.license_text()
+                              for about_object in self.about_objects
+                              if not sublist
+                              or about_object.about_resource_path in sublist]
+        about_notice_text = [about_object.notice_text()
+                             for about_object in self.about_objects
+                             if not sublist
+                             or about_object.about_resource_path in sublist]
+
+        return template.render(about_objects = about_validated_fields,
+                               license_texts = about_license_text,
+                               notice_texts = about_notice_text)
 
 def isvalid_about_file(file_name):
     """
@@ -910,7 +1057,7 @@ Options:
     -h,--help            Display help
     --verbosity  <arg>   Print more or less verbose messages while processing ABOUT files
         <arg>
-            0 - Do not print any warning or error messages, just a summary (default)
+            0 - Do not print any warning or error messages, just a total count (default)
             1 - Print error messages
             2 - Print error and warning messages
 """)
@@ -938,13 +1085,11 @@ def main(args, opts):
     for opt, opt_arg in opts:
         invalid_opt = True
         if opt in ('-h', '--help'):
-            invalid_opt = False
             syntax()
             option_usage()
             sys.exit(0)
 
         if opt in ('-v', '--version'):
-            invalid_opt = False
             version()
             sys.exit(0)
 
@@ -1001,7 +1146,8 @@ def main(args, opts):
         sys.exit(errno.EEXIST)
 
     if not exists(output_path) or (exists(output_path) and overwrite):
-        extract_about_info(input_path, output_path, opt_arg_num)
+        collector = AboutCollector(input_path, output_path, opt_arg_num)
+        collector.extract_about_info()
     else:
         # we should never reach this
         assert False, "Unsupported option(s)."
@@ -1011,7 +1157,7 @@ if __name__ == "__main__":
     longopts = ['help', 'version', 'overwrite', 'verbosity=']
     try:
         opts, args = getopt.getopt(sys.argv[1:], 'hv', longopts)
-    except Exception, e:
+    except Exception as e:
         print(repr(e))
         syntax()
         option_usage()
